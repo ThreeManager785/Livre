@@ -336,8 +336,8 @@ struct ContentView: View {
                         Text("Config.target-lang")
                     })
                 }
-                .onChange(of: sourceLanguage, targetLanguage) {
-                    currentLanguagePairIsAvailable = nil
+                .onChange(of: sourceLanguage, targetLanguage, useAppleIntelligence) {
+                    currentLanguagePairIsAvailable = useAppleIntelligence ? true : nil
                 }
                 Button(action: {
                     importerIsPresented = true
@@ -584,17 +584,85 @@ struct TranslationTask: View {
             Text(isTranslating ? "Translation.translating" : "Translation.complete")
             Spacer()
         }
-            .translationTask(source: sourceLanguage, target: targetLanguage) { mtSession in
-                print("Translate Task Start")
-                
-                let model = SystemLanguageModel(guardrails: .permissiveContentTransformations)
-                let llmSession = LanguageModelSession(model: model)
-//                    let options = GenerationOptions()
-                
-//                do {
-//                        let response = try await session.respond(to: "\() Introduce this Chinese hanzi character about it's meaning in two sentences. Don't add anything unnecessary.")
-//                        // Say about it's pronunciation, meaning and history. Explain it as Chinese character, and explain it in English.
-//                        answer = response.content
+        .onAppear {
+            Task {
+                if useAppleIntelligence {
+                    print("LLM Starts")
+                    let model = SystemLanguageModel(guardrails: .permissiveContentTransformations)
+                    let llmSession = LanguageModelSession(model: model)
+                    
+                    while !paragraphQueue.isEmpty {
+                        let index = translatedCount
+                        let text = paragraphQueue.removeFirst()
+                        let itemStart = Date()
+                        do {
+                            let response = try await llmSession.respond(to: "Translate the following text from \(sourceLanguage?.languageCode ?? "") to \(targetLanguage?.languageCode ?? ""). Only output the input's translation, no other content. Input: \(text)").content
+                            print("\(text) -> \(response)")
+                            print("---")
+                            paragraphResults[index] = response
+                        } catch {
+                            paragraphResults[index] = text // fallback keep original
+                        }
+                        let dt = Date().timeIntervalSince(itemStart)
+                        // Update a simple running average
+                        if translatedCount == 0 {
+                            averageSecondsPerItem = dt
+                        } else {
+                            let n = Double(translatedCount)
+                            averageSecondsPerItem = (averageSecondsPerItem * n + dt) / (n + 1)
+                        }
+                        translatedCount += 1
+                    }
+                    
+                    // Once done, rebuild HTML files from results and export EPUB
+                    guard translatedCount == totalParagraphs, let folder = workingFolder else { return }
+                    
+                    // Walk files again and apply replacements
+                    var resultIndex = 0
+                    for file in htmlFiles {
+                        guard let data = try? Data(contentsOf: file), let html = String(data: data, encoding: .utf8) else { continue }
+                        let paragraphs = EpubIO.extractParagraphs(from: html, wideMatch: useAppleIntelligence)
+                        var replacements: [Range<String.Index>: String] = [:]
+                        for p in paragraphs {
+                            if let translated = paragraphResults[resultIndex] {
+                                replacements[p.range] = translated
+                            }
+                            resultIndex += 1
+                        }
+                        let newHTML = EpubIO.replaceParagraphs(in: html, replacements: replacements)
+                        if let newData = newHTML.data(using: .utf8) {
+                            try? newData.write(to: file)
+                        }
+                    }
+                    
+                    // Update OPF title with translated value if we queued it
+                    if let tIndex = titleQueueIndex, let opf = opfURL, let translatedTitle = paragraphResults[tIndex] {
+                        EpubIO.writeTitle(translatedTitle, to: opf)
+                        if let identifier = targetLanguage?.minimalIdentifier {
+                            EpubIO.writeLanguage(identifier, to: opf)
+                        }
+                    }
+                    
+                    // Zip to output
+                    let out = FileManager.default.temporaryDirectory.appendingPathComponent("translated-\(UUID().uuidString).epub")
+                    do {
+                        await try EpubIO.zipEPUB(from: folder, to: out)
+                        await MainActor.run {
+                            self.exportURL = out
+                            self.isTranslating = false
+                        }
+                    } catch {
+                        await MainActor.run {
+                            self.translationError = String(describing: error)
+                            self.isTranslating = false
+                        }
+                    }
+                }
+            }
+        }
+        .translationTask(source: sourceLanguage, target: targetLanguage) { mtSession in
+            if !useAppleIntelligence {
+                print("MT Starts")
                 
                 // Consume the queue in order
                 while !paragraphQueue.isEmpty {
@@ -602,13 +670,14 @@ struct TranslationTask: View {
                     let text = paragraphQueue.removeFirst()
                     let itemStart = Date()
                     do {
-                        let response = try await {
-                            if useAppleIntelligence {
-                                return try await llmSession.respond(to: "Translate the following text from \(sourceLanguage?.languageCode ?? "") to \(targetLanguage?.languageCode ?? ""). Only output the input's translation, no other content. Input: \(text)").content
-                            } else {
-                                return try await mtSession.translate(text).targetText
-                            }
-                        }()
+                        let response = try await mtSession.translate(text).targetText
+                        //                        let response = try await {
+                        //                            if useAppleIntelligence {
+                        //                                return try await llmSession.respond(to: "Translate the following text from \(sourceLanguage?.languageCode ?? "") to \(targetLanguage?.languageCode ?? ""). Only output the input's translation, no other content. Input: \(text)").content
+                        //                            } else {
+                        //                                return try await mtSession.translate(text).targetText
+                        //                            }
+                        //                        }()
                         
                         paragraphResults[index] = response
                     } catch {
@@ -645,7 +714,7 @@ struct TranslationTask: View {
                         try? newData.write(to: file)
                     }
                 }
-
+                
                 // Update OPF title with translated value if we queued it
                 if let tIndex = titleQueueIndex, let opf = opfURL, let translatedTitle = paragraphResults[tIndex] {
                     EpubIO.writeTitle(translatedTitle, to: opf)
@@ -669,6 +738,7 @@ struct TranslationTask: View {
                     }
                 }
             }
+        }
     }
 }
 
