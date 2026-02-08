@@ -413,9 +413,11 @@ struct ContentView: View {
                 }, label: {
                     Text("Config.live-preview")
                 })
-                Toggle(isOn: $useAppleIntelligence, label: {
-                    Text("Config.use-apple.intelligence")
-                })
+                if SystemLanguageModel.default.isAvailable {
+                    Toggle(isOn: $useAppleIntelligence, label: {
+                        Text("Config.use-apple.intelligence")
+                    })
+                }
             }
             Section(content: {
                 if !isTranslating && exportURL == nil {
