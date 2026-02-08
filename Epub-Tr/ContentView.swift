@@ -5,12 +5,14 @@
 //  Created by ThreeManager785 on 2026/2/8.
 //
 
+import FoundationModels
 import ReadiumShared
 import ReadiumStreamer
+import ReadiumZIPFoundation
 import SwiftUI
 import Translation
 import UniformTypeIdentifiers
-import ReadiumZIPFoundation
+
 
 // MARK: - EPUB IO Helpers
 struct EpubIO {
@@ -149,10 +151,10 @@ struct EpubIO {
 //    }
     
     static func extractParagraphs(
-        from html: String
+        from html: String,
+        wideMatch: Bool = false
     ) -> [(range: Range<String.Index>, text: String)] {
 
-        // 更稳的 <p> 匹配
         let pattern = "(?is)<p\\b[^>]*>([\\s\\S]*?)</p>"
         guard let regex = try? NSRegularExpression(pattern: pattern) else {
             return []
@@ -164,7 +166,7 @@ struct EpubIO {
             range: NSRange(location: 0, length: ns.length)
         )
 
-        var result: [(Range<String.Index>, String)] = []
+        var paragraphs: [(range: Range<String.Index>, text: String)] = []
 
         for m in matches {
             guard m.numberOfRanges >= 2 else { continue }
@@ -179,7 +181,7 @@ struct EpubIO {
 
             var text = String(html[content])
 
-            // 1️⃣ 把 <br> / <br/> 先转成换行，避免“句子黏住”
+            // 1️⃣ <br> → 换行
             text = text.replacingOccurrences(
                 of: "(?i)<br\\s*/?>",
                 with: "\n",
@@ -198,11 +200,32 @@ struct EpubIO {
                 .replacingOccurrences(of: "\u{00a0}", with: " ")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
 
-            result.append((range: full, text: text))
+            paragraphs.append((range: full, text: text))
         }
 
-        return result
+        // 👉 wideMatch：每 20 个段落合并为 1 个
+        guard wideMatch, paragraphs.count > 0 else {
+            return paragraphs
+        }
+
+        var merged: [(range: Range<String.Index>, text: String)] = []
+        let chunkSize = 20
+
+        for start in stride(from: 0, to: paragraphs.count, by: chunkSize) {
+            let end = min(start + chunkSize, paragraphs.count)
+            let chunk = paragraphs[start..<end]
+
+            let mergedRange = chunk.first!.range.lowerBound..<chunk.last!.range.upperBound
+            let mergedText = chunk
+                .map { $0.text }
+                .joined(separator: "\n\n") // 保留段落感
+
+            merged.append((range: mergedRange, text: mergedText))
+        }
+
+        return merged
     }
+
 
     
 //    static func extractParagraphs(from html: String) -> [String] {
@@ -272,7 +295,8 @@ struct ContentView: View {
     @State private var exporterIsPresented = false
     @State var translateIsReady = false
     @State var translateTaskToggle = false
-    @State var livePreview = true
+    @State var livePreviewIndex = 1
+    @State var useAppleIntelligence = false
 
     @State private var opfURL: URL?
     @State private var titleQueueIndex: Int? = nil
@@ -286,12 +310,12 @@ struct ContentView: View {
         List {
             Section(content: {
                 if importedFile == nil {
-                    Text("Welcome to Livre. \n\nSelect an EPUB file to translate.")
+                    Text("Welcome.prompt.initial")
                 } else {
-                    Text("Welcome to Livre. \n\nEPUB file had been loaded.")
+                    Text("Welcome.prompt.imported")
                 }
             }, footer: {
-                Text("Made by ThreeManager785.")
+                Text("Welcome.author")
             })
             Section {
                 Group {
@@ -301,7 +325,7 @@ struct ContentView: View {
                                 .tag(Locale.Language.init(identifier: item))
                         }
                     }, label: {
-                        Text("Source Language")
+                        Text("Config.source-lang")
                     })
                     Picker(selection: $targetLanguage, content: {
                         ForEach(languageCodes, id: \.self) { item in
@@ -309,22 +333,19 @@ struct ContentView: View {
                                 .tag(Locale.Language.init(identifier: item))
                         }
                     }, label: {
-                        Text("Target Language")
+                        Text("Config.target-lang")
                     })
                 }
-                .onChange(of: sourceLanguage) {
-                    currentLanguagePairIsAvailable = nil
-                }
-                .onChange(of: targetLanguage) {
+                .onChange(of: sourceLanguage, targetLanguage) {
                     currentLanguagePairIsAvailable = nil
                 }
                 Button(action: {
                     importerIsPresented = true
                 }, label: {
-                    Text(importedFile?.lastPathComponent ?? "Select EPUB…")
+                    Text(importedFile?.lastPathComponent ?? String(localized: "Config.select-epub"))
                 })
-                .onChange(of: importedFile) { _, newURL in
-                    guard let input = newURL else { return }
+                .onChange(of: importedFile, sourceLanguage, targetLanguage, useAppleIntelligence) {
+                    guard let input = importedFile else { return }
                     translateIsReady = false
 //                    isTranslating = true
                     translationError = nil
@@ -364,7 +385,7 @@ struct ContentView: View {
                             for file in htmls {
                                 let data = try Data(contentsOf: file)
                                 guard let html = String(data: data, encoding: .utf8) else { continue }
-                                let paragraphs = EpubIO.extractParagraphs(from: html)
+                                let paragraphs = EpubIO.extractParagraphs(from: html, wideMatch: useAppleIntelligence)
                                 queue.append(contentsOf: paragraphs.map { $0.text })
                             }
                             await MainActor.run {
@@ -382,28 +403,27 @@ struct ContentView: View {
                         }
                     }
                 }
-                Toggle(isOn: $livePreview) {
-                    Text("Live Preview")
-                }
+                Picker(selection: $livePreviewIndex, content: {
+                    Text("Config.live-preview.off")
+                        .tag(0)
+                    Text("Config.live-preview.source")
+                        .tag(1)
+                    Text("Config.live-preview.target")
+                        .tag(2)
+                }, label: {
+                    Text("Config.live-preview")
+                })
+                Toggle(isOn: $useAppleIntelligence, label: {
+                    Text("Config.use-apple.intelligence")
+                })
             }
             Section(content: {
                 if !isTranslating && exportURL == nil {
                     Button(action: {
-                        Task {
-//                            do {
-//                                await MainActor.run {
-                                    isTranslating = true
-                                    translateTaskToggle = true
-//                                }
-//                            } catch {
-//                                await MainActor.run {
-//                                    self.translationError = String(describing: error)
-//                                    self.isTranslating = false
-//                                }
-//                            }
-                        }
+                        isTranslating = true
+                        translateTaskToggle = true
                     }, label: {
-                        Text("Start Translation")
+                        Text("Translation.start")
                     })
                     .disabled(!translateIsReady)
                     .disabled(currentLanguagePairIsAvailable != true)
@@ -414,6 +434,14 @@ struct ContentView: View {
                             }
                         }
                     }
+                }
+                if isTranslating {
+                    Button(action: {
+                        isTranslating = false
+                        translateTaskToggle = false
+                    }, label: {
+                        Text("Translate.stop")
+                    })
                 }
                 if translateTaskToggle {
                     Section {
@@ -431,43 +459,53 @@ struct ContentView: View {
                             workingFolder: $workingFolder,
                             opfURL: $opfURL,
                             titleQueueIndex: $titleQueueIndex,
-                            averageSecondsPerItem: $averageSecondsPerItem)
+                            averageSecondsPerItem: $averageSecondsPerItem,
+                            useAppleIntelligence: $useAppleIntelligence)
                     }
                 }
                 if isTranslating {
                     HStack {
-                        Text("\(translatedCount)/\(totalParagraphs)")
+                        Text(verbatim: "\(translatedCount)/\(totalParagraphs)")
                         Spacer()
                         if let eta = estimatedTimeLeftString() {
-                            Text("Estimated Time Left: \(eta)")
+                            Text("Translation.eta.\(eta)")
                                 .foregroundStyle(.secondary)
                         }
                     }
                     ProgressView(value: totalParagraphs == 0 ? 0 : Double(translatedCount) / Double(totalParagraphs))
-                    if livePreview, let currentTranslatingContent = paragraphQueue.first {
+                    if livePreviewIndex == 1, let currentTranslatingContent = paragraphQueue.first {
                         Text(currentTranslatingContent)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    
+                    if livePreviewIndex == 2, let currentContent = paragraphResults.sorted(by: { $0.key > $1.key }).first?.1 {
+                        Text(currentContent)
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
                 } else if let exportURL {
                     Text("\(exportURL.lastPathComponent)")
-                    Button("Export…") {
+                    Button("Translation.export") {
                         exporterIsPresented = true
                     }
                 }
                 if let translationError {
-                    Text("Error: \(translationError)")
+                    Text("Translation.error.\(translationError)")
                         .foregroundStyle(.red)
                 }
             }, header: {
                 Text("Translation")
             }, footer: {
                 if !translateIsReady {
-                    Text("Select an EPUB to continue.")
+                    Text("Translation.start.error.select-epub")
                 }
                 if currentLanguagePairIsAvailable == false {
-                    
-                    Text("You will need to download the languages first in Settings. Go to “Settings”>“Apps”>“Translate”>“Languages” on iOS or “Settings”>“General”>“Language & Region”>“Translation Languages...” on macOS to download.")
+                    if targetLanguage?.languageCode == sourceLanguage?.languageCode {
+                        Text("Translation.start.error.same-language")
+                    } else {
+                        Text("Translation.start.error.no-offline-translation")
+                    }
                 }
             })
         }
@@ -476,8 +514,7 @@ struct ContentView: View {
                 importedFile = url
             }
         })
-        .fileExporter(isPresented: $exporterIsPresented, document: exportURL.map { URLDocument(url: $0) }, contentTypes: [.epub]) { result in
-            // You can handle result success/failure if needed
+        .fileExporter(isPresented: $exporterIsPresented, document: exportURL.map { URLDocument(url: $0) }, contentTypes: [.epub]) { _ in
         }
         .onAppear {
             Task {
@@ -532,6 +569,8 @@ struct TranslationTask: View {
     @Binding var opfURL: URL?
     @Binding var titleQueueIndex: Int?
     @Binding var averageSecondsPerItem: Double
+    
+    @Binding var useAppleIntelligence: Bool
     var body: some View {
         HStack {
             if isTranslating {
@@ -540,20 +579,36 @@ struct TranslationTask: View {
                 Image(systemName: "checkmark.circle")
                     .foregroundStyle(.green)
             }
-            Text(isTranslating ? "Translating..." : "Translation Completed")
+            Text(isTranslating ? "Translation.translating" : "Translation.complete")
             Spacer()
         }
-            .translationTask(source: sourceLanguage, target: targetLanguage) { session in
+            .translationTask(source: sourceLanguage, target: targetLanguage) { mtSession in
                 print("Translate Task Start")
+                
+                let model = SystemLanguageModel(guardrails: .permissiveContentTransformations)
+                let llmSession = LanguageModelSession(model: model)
+//                    let options = GenerationOptions()
+                
+//                do {
+//                        let response = try await session.respond(to: "\() Introduce this Chinese hanzi character about it's meaning in two sentences. Don't add anything unnecessary.")
+//                        // Say about it's pronunciation, meaning and history. Explain it as Chinese character, and explain it in English.
+//                        answer = response.content
+                
                 // Consume the queue in order
                 while !paragraphQueue.isEmpty {
                     let index = translatedCount
                     let text = paragraphQueue.removeFirst()
                     let itemStart = Date()
                     do {
-                        print(text)
-                        let response = try await session.translate(text)
-                        paragraphResults[index] = response.targetText
+                        let response = try await {
+                            if useAppleIntelligence {
+                                return try await llmSession.respond(to: "Translate the following text from \(sourceLanguage?.languageCode ?? "") to \(targetLanguage?.languageCode ?? ""). Only output the input's translation, no other content. Input: \(text)").content
+                            } else {
+                                return try await mtSession.translate(text).targetText
+                            }
+                        }()
+                        
+                        paragraphResults[index] = response
                     } catch {
                         paragraphResults[index] = text // fallback keep original
                     }
@@ -575,7 +630,7 @@ struct TranslationTask: View {
                 var resultIndex = 0
                 for file in htmlFiles {
                     guard let data = try? Data(contentsOf: file), let html = String(data: data, encoding: .utf8) else { continue }
-                    let paragraphs = EpubIO.extractParagraphs(from: html)
+                    let paragraphs = EpubIO.extractParagraphs(from: html, wideMatch: useAppleIntelligence)
                     var replacements: [Range<String.Index>: String] = [:]
                     for p in paragraphs {
                         if let translated = paragraphResults[resultIndex] {
@@ -612,5 +667,19 @@ struct TranslationTask: View {
                     }
                 }
             }
+    }
+}
+
+extension View {
+    func onChange<each V: Equatable>(
+        of value: repeat each V,
+        initial: Bool = false,
+        _ action: @escaping () -> Void
+    ) -> some View {
+        var result = AnyView(self)
+        for v in repeat each value {
+            result = AnyView(result.onChange(of: v, initial: initial, action))
+        }
+        return result
     }
 }
